@@ -1,4 +1,4 @@
-# 05 — Database Indexing: Complete Deep Dive (Merged: Article + Explanations)
+# 05 — Database Indexing: Complete Deep Dive 
 
 > Ye original "Database Indexing - Complete Deep Dive" article hai, but har dense/jargon-heavy section ke turant baad ek **"🔍 Explained"** box dala hai jisme wahi cheez frontend-engineer-friendly tarike se, examples ke saath samjhayi gayi hai. Ab tumhe do alag files switch nahi karni — sab ek hi jagah hai, order me.
 
