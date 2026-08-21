@@ -1,256 +1,249 @@
-# 06 — Indexing Deep Dive (Making Queries Fast)
+# 05 — Drivers, ORMs, Tools, Environments & Connection Pooling
 
-> **Is lesson me:** Index kya hai aur kyu queries ko dramatically fast karta hai, B-Tree/Hash/Composite/Covering indexes, disk reads ka connection, cardinality, aur sabse important — **kab index NAHI lagana chahiye**. Ye poore performance ka core hai.
+> **Is lesson me:** Poora practical stack jo tumhara app aur database ke beech baithta hai — driver (psycopg2), ORM (SQLAlchemy), GUI tools (pgAdmin), environments (dev/QA/staging/prod), aur **connection pooling + threading** (jo tumne alag se poocha tha — yahi iski sahi jagah hai).
 
-Prerequisites: `04-How-A-Query-Travels.md` (disk vs RAM, query planner samajh liya ho)
-
----
-
-## 1. Index kya hai — aur kyu
-
-**Index** = ek extra data structure jo queries ko fast banata hai, **full table scan** avoid karke. Bina index, database har row check karta hai; index se seedha matching rows pe jump karta hai.
-
-**Analogy:** Ek textbook ka index (peeche wala). "Binary Search" dhundhna hai? Bina index → har page palto. Index se → "Binary Search → page 142" dekho, seedha wahan jao.
-
-```
-Bina index (full table scan):
-  Table: 10 million rows
-  Query: SELECT * FROM users WHERE email = 'bob@mail.com'
-  → saari 10M rows check karo → O(N) → SLOW (seconds)
-
-Index ke saath (email pe):
-  → index me binary-search jaisa lookup → O(log N) → FAST (milliseconds)
-```
-
-> **"Row" aur "full scan" quick recap:** Row = ek record (`{id:1, name:"Bob", age:25}`). Full table scan = database har ek row ko ek-ek karke check karta hai. 10M rows = potentially 10M disk reads = seconds. Index isliye chahiye.
-
-> **Disk reads yaad hai? (lesson 04):** Disk RAM se ~1000x slow hai. Index ka poora point = **disk reads kam karna**. `O(N)` (slow) vs `O(log N)` (fast) directly disk-reads-count se correlate karta hai.
+Prerequisites: `04-How-A-Query-Travels.md`
 
 ---
 
-## 2. B-Tree Index — the default (Postgres/MySQL)
+## 1. Driver — database se "baat karne" wali library
 
-Sabse common index type. Ek **balanced tree** structure:
-- Har node me multiple **sorted keys**
-- Leaf nodes actual table rows ko point karte hai
-- Tree balanced rehta hai (saare leaves same depth pe)
+Database ka apna **wire protocol** hota hai (data ko network pe bhejne ka specific binary format — Postgres ka apna, MySQL ka apna, HTTP se alag). Tum khud ye protocol nahi likhna chahte.
 
-### Node aur key kya hai (concrete example)
+**Driver** = ek library jo ye protocol already implement kiye baithi hai. Tum bas driver ko query do, wo baaki sab handle karta hai.
 
-Ek **node** = ek disk block/page (ek "box") jisme **100-500 sorted key entries** fit hote hai (na ki sirf 1 per node jaise normal binary tree). Isliye tree "wide" hota hai.
-
-Ek **key** = indexed column ki value (jaise `age=25`) + ek **pointer** jo batata hai row disk pe kaha hai. Key khud data nahi, ek signpost hai.
-
-```
-Table: users
-  {id:1, name:"Bob", age:25}, {id:2, name:"Alice", age:30}, {id:3, name:"Eve", age:25}
-
-Index on age (tree form):
-                    [ age=27 ]                 ← root node
-                   /            \
-          [age=25]              [age=30]        ← leaf nodes (sorted keys)
-          pointers:              pointers:
-          → row 1 (Bob)          → row 2 (Alice)
-          → row 3 (Eve)
-
-Query WHERE age=25:
-  root pe 25 < 27 → left child → key=25 mila → pointers se row 1, 3 fetch
-  → 2 hops (2 disk reads), Alice ka row touch hi nahi hua
+```python
+import psycopg2   # Postgres ka Python driver
+conn = psycopg2.connect("postgresql://user:pass@localhost:5432/mydb")
+cursor = conn.cursor()
+cursor.execute("SELECT * FROM users WHERE age > 25")
+rows = cursor.fetchall()
+# Driver internally: TCP connection khola, query ko Postgres wire protocol me
+# encode kiya, bheja, binary response decode karke Python tuples banaye
 ```
 
-### Depth aur "wide tree" ka magic
+**Frontend analogy:** Driver = `axios`/`fetch` jaisa. Tum manually HTTP headers/body encode nahi karte — `axios.get(url)` bolte ho, axios saara HTTP handle karta hai. Driver wahi kaam karta hai, HTTP ke bajaye database ke wire protocol ke liye.
 
-Kyunki har node 100-500 keys rakhta hai, tree bahut wide + shallow hota hai:
-```
-1 million rows  → depth ~3
-1 billion rows  → depth ~4-5 (barely increases!)
-```
-Ye **logarithmic (O(log N))** growth hai — data 1000x badhe, depth sirf 1-2 level. **Har level = 1 disk read.** Isliye chahe billions rows ho, lookup sirf **3-5 disk reads = milliseconds**.
-
-**B-Tree supports:**
-```
-Equality:  WHERE age = 25
-Range:     WHERE age BETWEEN 20 AND 40
-Prefix:    WHERE name LIKE 'Bob%'
-Sorting:   ORDER BY age  (tree already sorted!)
-```
-
----
-
-## 3. Hash Index — O(1) but limited
-
-Key ko hash function se seedha exact row location pe map karta hai. O(1) lookup.
-
-```
-Hash Index on email:
-  hash('bob@mail.com')   → bucket 7 → row 42
-  hash('alice@mail.com') → bucket 3 → row 18
-
-Query WHERE email = 'bob@mail.com':
-  hash('bob@mail.com') = bucket 7 → row 42 found → O(1)!
-```
-
-> **Hash function recap (detail lesson 11 me):** hash = koi bhi input ko ek fixed-size number me convert karta hai, deterministically. Similar inputs → completely unrelated outputs.
-
-**Hash index supports:** sirf **Equality** (`WHERE email = 'x'`)
-**Does NOT support:** Range (`age > 25`), Sorting, Prefix
-
-**Kyu range nahi?** Hash "avalanche effect" — `hash(24), hash(25), hash(26)` bilkul unrelated random numbers. Koi order nahi bacha, isliye "range" nikalna impossible. B-Tree range support karta hai kyunki wo data **sorted** rakhta hai (hash nahi karta):
-```
-B-Tree (sorted):     [10,15,20,25,30,35,40]  → range easy, consecutive
-Hash (scattered):    bucket7, bucket2, bucket9  → koi order nahi, range impossible
-```
-
----
-
-## 4. Composite Index — multiple columns
-
-Ek index jo multiple columns pe ho. **Column order bahut matter karta hai.**
-
-```sql
-CREATE INDEX idx_country_age ON users (country, age);
-```
-```
-Sorted by country FIRST, phir age within each country:
-  ('India', 20), ('India', 25), ('India', 30),
-  ('USA', 18), ('USA', 22), ('USA', 35)
-```
-
-### The Left-Prefix Rule (critical)
-
-Index `(A, B, C)` in queries ke liye use hota hai:
-
-| Query | Index use? | Why |
+**Common drivers:**
+| Database | Python | Node.js |
 |---|---|---|
-| `WHERE A = x` | ✅ | Left-most |
-| `WHERE A = x AND B = y` | ✅ | Left prefix |
-| `WHERE A = x AND B = y AND C = z` | ✅ | Full |
-| `WHERE B = y` | ❌ | A skip kiya (left-most missing) |
-| `WHERE C = z` | ❌ | A, B skip kiye |
-| `WHERE A = x AND C = z` | ⚠️ Partial | Sirf A use, phir C ke liye scan |
-
-**Analogy:** Phone book last-name phir first-name se sorted hai. "First name = Bob" dhundhna = koi help nahi (poora scan). "Last name = Sharma" = seedha jump. Index sirf **left-to-right, in order** useful hai.
-
-**Rule of thumb:** most selective (unique) column pehle, **equality conditions pehle, range condition last:**
-```sql
--- GOOD: equality first, range last
-CREATE INDEX idx ON orders (user_id, status, created_at);
--- WHERE user_id=123 AND status='active' AND created_at > '2024-01-01' ✅
-
--- BAD: range beech me → uske baad wale columns index use nahi kar paate
-CREATE INDEX idx ON orders (user_id, created_at, status);
--- created_at range ke baad status index se filter nahi ho paata
-```
+| Postgres | `psycopg2`, `asyncpg` | `pg` (node-postgres) |
+| MySQL | `mysqlclient`, `PyMySQL` | `mysql2` |
 
 ---
 
-## 5. Covering Index — table touch hi mat karo
+## 2. ORM — objects ↔ SQL (driver ke upar ek layer)
 
-Ek index jisme **query ke saare needed columns** ho. Database poora answer index se hi de deta hai, table tak jaaye bina.
+**ORM (Object-Relational Mapper)** driver ke **upar** baithta hai. Ye tumhe raw SQL likhne ke bajaye, apni language ke **objects/classes** se database use karne deta hai.
 
-```sql
-SELECT name, email FROM users WHERE age > 25;
+```python
+# WITHOUT ORM (raw SQL via driver):
+cursor.execute("SELECT * FROM users WHERE age > %s", (25,))
+rows = cursor.fetchall()   # raw tuples: [(1, "Bob", 25), ...]
 
--- Regular index on (age): 2 hops
---   Hop 1: index se age>25 wale row-IDs nikaalo
---   Hop 2: har row-ID ke liye TABLE pe jao, name/email fetch karo
---          (1000 rows match = 1000 EXTRA disk reads!)
+# WITH ORM (SQLAlchemy):
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    age = Column(Integer)
 
--- Covering index on (age, name, email): 1 hop
-CREATE INDEX idx_cov ON users (age, name, email);
---   name/email index me hi hai → table jaane ki zarurat nahi (index-only scan)
+users = session.query(User).filter(User.age > 25).all()
+# users = actual Python objects: [User(id=1, name="Bob", age=25), ...]
+# tum user.name likh sakte ho, jaise normal object
 ```
 
-Ye "extra hop to table" (random disk locations, expensive) completely skip ho jaata hai.
-**Trade-off:** covering index bada hota hai (zyada data store) aur writes slow. Sirf critical, frequently-run queries ke liye.
+**Important:** ORM khud network pe SQL nahi bhejta — wo andar-andar **driver ko hi use karta hai**. Layering:
+
+```
+Your App Code
+     │
+     ▼
+ORM (SQLAlchemy)     ← objects ↔ SQL translate
+     │
+     ▼
+Driver (psycopg2)    ← SQL ↔ wire protocol translate
+     │
+     ▼ (TCP)
+Postgres Server
+```
+
+**Frontend analogy:** ORM = **React Query / SWR**, jo `fetch`/`axios` (driver) ke upar baithti hai aur tumhe clean hooks deti hai raw fetch calls ke bajaye. SQLAlchemy = "React Query for databases", psycopg2 = "axios for databases".
+
+**ORM kyu use karte hai:**
+- Raw SQL kam likhna padta hai (especially complex JOINs)
+- Type safety (editor ko pata hai `User.age` integer hai)
+- Database-agnostic (Postgres → MySQL switch, mostly config change)
+- **SQL injection se auto-protection** (ORM parameters safely escape karta hai)
+
+**Trade-off:** ORM kabhi inefficient SQL generate karta hai. Isliye bade systems me critical/hot queries kabhi raw SQL me likhte hai, baaki ORM se.
+
+> **SQL injection kya hai (quick):** Agar tum user input ko directly SQL string me joDo — `"SELECT * FROM users WHERE name = '" + userInput + "'"` — aur user `'; DROP TABLE users; --` type kare, toh wo tumhari table hi delete kar sakta hai. **Fix:** hamesha "parameterized queries" use karo (`WHERE name = %s` with separate values) — driver/ORM input ko safely escape kar deta hai. Ye ek critical security basic hai.
 
 ---
 
-## 6. Index types quick comparison
+## 3. pgAdmin & GUI tools — database ko dekhne ke liye
 
-| Type | Lookup | Range | Sort | Size | Best for |
-|---|---|---|---|---|---|
-| B-Tree | O(log N) | ✅ | ✅ | Medium | General (default) |
-| Hash | O(1) | ❌ | ❌ | Small | Exact match |
-| Composite | O(log N) | ✅ (leftmost) | ✅ | Larger | Multi-column |
-| Covering | O(log N) | ✅ | ✅ | Large | Avoid table hops |
-| GIN | O(log N) | Depends | ❌ | Large | Full-text, arrays, JSON |
-| GiST | O(log N) | ✅ | Depends | Medium | Geospatial, ranges |
-| BRIN | O(1) | ✅ | ✅ | Tiny | Naturally-ordered data (timestamps) |
+**pgAdmin** (ya DBeaver, TablePlus, MySQL Workbench) ek **GUI app** hai jo database se connect hoke tumhe **visually** tables/data dikhata hai — manually SQL likhe bina browse/edit/query karne ke liye.
+
+**Key insight:** pgAdmin bhi utna hi ek "client" hai jitna tumhara app! Wo bhi same connection string se, same port pe connect hota hai:
+
+```
+pgAdmin (GUI)   ─────┐
+Your App        ─────┼───▶ same Postgres Server (port 5432)
+A migration script ──┘      (sab alag "clients", ek hi DB se)
+```
+
+**Frontend analogy:** pgAdmin = Chrome DevTools, but database ke liye. Jaise DevTools me tum Network/Console manually inspect karte ho bina app UI ke, waise pgAdmin me database directly browse/query karte ho bina app chalaye.
+
+**Kab use:** debugging ("data actually table me hai?"), manual fixes, schema explore, quick one-off queries.
 
 ---
 
-## 7. The Cost of Indexes — kab NAHI lagana
+## 4. Environments — dev / QA / staging / prod
 
-Indexes free nahi hai:
+Ek hi "database" ka matlab actually **multiple completely separate database instances** hote hai — har environment ke liye ek:
+
 ```
-1. WRITE OVERHEAD — har INSERT table + saare indexes update karta hai
-                    (5 indexes = 6 writes per INSERT)
-2. STORAGE        — indexes disk space lete hai (kabhi table se bhi bade)
-3. MEMORY         — indexes RAM me fit hone chahiye (more indexes = more RAM)
-4. MAINTENANCE    — fragment ho sakte hai (REINDEX), migrations slow
+LOCAL/DEV DB          QA DB              STAGING DB          PRODUCTION DB
+(tumhara laptop)   (QA team tests)    (prod-jaisa final    (REAL users ka
+localhost               |              check)               REAL data)
+   |                    |                 |                     |
+fake data          test data         prod-like data       real, sensitive data
 ```
 
-**Kab index NAHI lagao:**
-| Scenario | Kyu |
-|---|---|
-| Chhoti tables (< 1000 rows) | Full scan already fast, overhead worth nahi |
-| Write-heavy tables | Har write saare indexes update karta hai (slow writes) |
-| Low-cardinality columns | Boolean, status (3 values) — index zyada help nahi karta |
-| Rarely-queried columns | Index unused, but storage/write cost leta hai |
-| Frequently-updated columns | Har update = index modification |
-| Wide columns (TEXT/BLOB) | Bade values pe index expensive |
+Ye **alag machines/instances** pe hote hai taaki:
+- Tum local pe experiment/break karo bina QA/prod affect kiye
+- QA test kare bina real user data touch kiye
+- Galti se `DELETE FROM users` prod pe na chal jaye
 
-> **Cardinality reminder:** kitne unique values. `status` (3 values) = low cardinality — index banao bhi toh 3 hi groups, har ek me lakhs rows, scan se zyada fast nahi. `userId`/`email` (millions unique) = high cardinality = index ke liye best.
+**Kaise switch hota hai:** environment variables se — bilkul frontend `.env` jaisa:
+```bash
+# .env.local
+DATABASE_URL=postgresql://dev:pass@localhost:5432/myapp_dev
+
+# .env.production
+DATABASE_URL=postgresql://prod:securepass@prod-db.internal:5432/myapp_prod
+```
+App code same rehta hai — bas `DATABASE_URL` alag hota hai. CI/CD pipeline decide karta hai kaunsa `.env` kis environment me.
+
+**Migrations:** Jab schema change karo (naya column add), ye change har environment me alag se apply karna padta hai — ek "migration tool" (Alembic for SQLAlchemy, Django migrations, Flyway) se, jo versioned scripts banata hai jinhe tum dev → QA → staging → prod, sab jagah same order me chalate ho.
 
 ---
 
-## 8. Index selection strategy (interview-ready)
+## 5. Connection Pooling — (tumhara specific sawaal)
+
+### Problem: connection banana MEHENGA hai
+
+Har baar jab tumhara app database se connect karta hai, ye hota hai:
+```
+1. TCP connection khulna (network handshake) — kuch milliseconds
+2. Authentication (username/password verify) — aur time
+3. Session setup (memory allocate on DB server side)
+```
+Ye **har request pe** karna bahut waste hai. Socho ek API jo har request pe naya connection khole, query kare, phir band kare — 1000 requests/sec pe ye 1000 connection-setups/sec = massive overhead, aur database server ki bhi limit hoti hai (Postgres default ~100 concurrent connections).
+
+### Solution: Connection Pool
+
+**Connection pool** = pehle se khuli hui connections ka ek set (jaise 20 connections) jo "ready" pada rehta hai. App ko jab connection chahiye, wo pool se ek **borrow** karta hai, query karta hai, phir connection ko **wapas pool me** de deta hai (band nahi karta).
 
 ```
-Step 1: Hot queries identify karo (most frequent, slowest)
-Step 2: Har query ke WHERE aur ORDER BY columns dekho
-Step 3: Composite index banao:
-        - equality columns pehle (left to right)
-        - range/sort column last
-Step 4: Covering index worth hai? (critical queries ke liye)
-Step 5: Over-indexing avoid karo (max ~5-7 per table)
-```
-```sql
--- Hot query: "user ke recent orders, status se filter"
--- SELECT * FROM orders WHERE user_id=? AND status=? ORDER BY created_at DESC
-CREATE INDEX idx ON orders (user_id, status, created_at DESC);
--- user_id: equality (selective), status: equality, created_at: range/sort last
+┌─────────────────────────────────────────────┐
+│           CONNECTION POOL (size = 5)         │
+│   [conn1] [conn2] [conn3] [conn4] [conn5]    │  ← ye 5 connections
+│                                              │     hamesha khuli rehti hai
+└─────────────────────────────────────────────┘
+        ▲ borrow          │ return
+        │                 ▼
+   Request A          (query done,
+   needs a conn        conn wapas pool me)
 ```
 
-**Real companies:** Uber (geospatial indexes for "drivers near me"), Twitter (composite on `(user_id, created_at)` for timelines), Stripe (B-tree on `payment_intent_id` + idempotency key), Netflix (BRIN on timestamps for time-range).
+Flow:
+```
+Request A aayi   → pool se conn2 borrow kiya → query chalayi → conn2 wapas pool me
+Request B aayi   → pool se conn2 (ab free hai) borrow kiya → ...
+Agar saari 5 busy hai aur 6th request aati hai → wo WAIT karti hai jab tak koi free ho
+```
+
+**Fayde:**
+- Connection setup ka cost sirf ek baar (pool banate waqt), har request pe nahi
+- Database server pe controlled number of connections (overload nahi)
+- Fast — borrow/return microseconds me
+
+**Frontend analogy:** Ye bilkul ek **object pool / resource pool** jaisa hai. Ya socho ek car rental — har trip ke liye nayi car mat khareedo (slow, expensive); ek fleet rakho, trip ke liye ek car lo, wapas kar do. Connection pool = "connection rental fleet".
+
+**Practical:** Tum ye khud nahi likhte — libraries handle karti hai:
+- Python: SQLAlchemy ka built-in pool, ya `PgBouncer` (external pooler)
+- Node.js: `pg` library ka `Pool` class
+- Managed: cloud databases (AWS RDS Proxy, Supabase pooler) ye provide karte hai
+
+**Pool size tuning:** Bahut chhota pool → requests wait karti hai (slow). Bahut bada pool → database overload. Rule of thumb usually: `pool_size ≈ (number of app server threads/workers)`, aur total connections across all app servers database ki limit se kam. (Ye tuning real-world me monitor karke adjust hoti hai.)
 
 ---
 
-## 9. Clustered vs Secondary index (interview favorite)
+## 6. Threading — connections aur concurrency ka relation
 
-- **Clustered (primary key) index:** table ki rows **physically** primary-key order me stored hoti hai. Ek hi per table.
-- **Secondary index:** ek alag structure jo primary key ko point karta hai. Lookup me ek extra hop lagta hai (secondary → primary → full row).
+**Threading** = ek program ka ek saath multiple kaam (threads) parallel chalana. Backend servers usually multi-threaded ya multi-worker hote hai — matlab ek server ek time pe kayi requests handle karta hai.
+
+Yaha connection pool se connection kaise juDta hai:
 
 ```
-Clustered (by id): rows themselves sorted by id on disk
-  [id:1 Bob] [id:2 Alice] [id:3 Eve]
+App Server (4 threads handling 4 requests simultaneously):
 
-Secondary (on email): separate structure
-  "alice@"→id 2, "bob@"→id 1  → phir clustered se full row (2 hops)
+  Thread 1 (Request A) ──┐
+  Thread 2 (Request B) ──┤
+  Thread 3 (Request C) ──┼──▶ CONNECTION POOL ──▶ Database
+  Thread 4 (Request D) ──┘     (borrow/return)
+```
+
+**Key rule:** Ek database connection ek time pe sirf **ek thread** safely use kar sakta hai (connections thread-safe nahi hote for concurrent queries). Isliye:
+- Har thread jab query karna chahe, pool se apni ek connection borrow karta hai
+- Query khatam, connection wapas pool me, doosra thread use kar sakta hai
+- Isliye pool size roughly tumhare concurrent threads/workers ke barabar rakha jaata hai
+
+**Frontend analogy:** JS single-threaded hai (ek main thread), isliye tumne ye kabhi directly nahi jhela. But socho `Promise.all([...])` se 4 API calls parallel — agar har call ko ek "connection" chahiye ek shared resource se, tumhe 4 connections chahiye ya unhe queue karna paDe. Backend threading me exactly yahi hota hai, aur pool ye resource-sharing manage karta hai.
+
+**Deadlock warning (advanced but useful):** Agar ek thread do connections hold kare aur doosra thread bhi ulte order me — dono ek dusre ka wait kar sakte hai (deadlock). Isliye best practice: connection ko jitni jaldi ho sake borrow karke wapas karo, aur ek transaction ke andar ek network call (jaise external API) mat karo jab tak connection/lock hold hai. (Locks + deadlocks ka detail lesson 09 me.)
+
+---
+
+## 7. Full practical stack — one diagram
+
+```
+                    ┌───────────────────────┐
+                    │   Your Backend App     │
+                    │   (multi-threaded)     │
+                    └───────────┬───────────┘
+                                │
+                    ┌───────────▼───────────┐
+                    │   ORM (SQLAlchemy)     │  objects ↔ SQL
+                    └───────────┬───────────┘
+                    ┌───────────▼───────────┐
+                    │  Connection Pool       │  borrow/return connections
+                    └───────────┬───────────┘
+                    ┌───────────▼───────────┐
+                    │   Driver (psycopg2)    │  SQL ↔ wire protocol
+                    └───────────┬───────────┘
+                                │ TCP (DATABASE_URL from env)
+                ┌───────────────┼───────────────┐
+                ▼               ▼               ▼
+          [Dev Postgres]  [QA Postgres]  [Prod Postgres]
+                ▲
+                │ (also connects here to browse manually)
+          [pgAdmin GUI]
 ```
 
 ---
 
 ## Quick Self-Check
-1. Index disk reads kaise kam karta hai — `O(N)` vs `O(log N)` ka disk-read se relation?
-2. B-Tree me "node" aur "key" kya hai — apne words me example ke saath.
-3. B-Tree depth billions rows pe bhi kam kyu rehti hai?
-4. Hash index range queries kyu nahi kar sakta (root cause)?
-5. Left-prefix rule kya hai — `(A,B,C)` pe `WHERE B=y` kyu use nahi hota?
-6. Covering index kaunsa "hop" bachata hai?
-7. Index kab NAHI lagana chahiye — 3 scenarios?
-8. Clustered aur secondary index me difference?
+1. Driver kya kaam karta hai — axios se analogy?
+2. ORM aur driver me difference — layering kaise hai?
+3. SQL injection kya hai, aur parameterized queries isse kaise rokte hai?
+4. pgAdmin technically "client" kyu hai?
+5. Dev/QA/staging/prod DBs alag kyu, aur app ko kaise pata chalta hai kaunse se connect kare?
+6. Connection banana "mehenga" kyu hai, aur connection pool ise kaise fix karta hai?
+7. Threading aur connection pool ka relation kya hai — pool size kis hisaab se set karte hai?
 
 ---
-**Next:** `07-Query-Complexity-Big-O.md` — har operation ki exact cost, aur DB-by-DB comparison.
+**Next:** `06-Indexing-Deep-Dive.md` — ab queries ko fast banate hai (indexes).
