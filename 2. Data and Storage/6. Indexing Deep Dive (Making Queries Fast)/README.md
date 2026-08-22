@@ -1,333 +1,256 @@
-# 05 — Database Indexing: Complete Deep Dive 
+# 06 — Indexing Deep Dive (Making Queries Fast)
 
-> Ye original "Database Indexing - Complete Deep Dive" article hai, but har dense/jargon-heavy section ke turant baad ek **"🔍 Explained"** box dala hai jisme wahi cheez frontend-engineer-friendly tarike se, examples ke saath samjhayi gayi hai. Ab tumhe do alag files switch nahi karni — sab ek hi jagah hai, order me.
+> **Is lesson me:** Index kya hai aur kyu queries ko dramatically fast karta hai, B-Tree/Hash/Composite/Covering indexes, disk reads ka connection, cardinality, aur sabse important — **kab index NAHI lagana chahiye**. Ye poore performance ka core hai.
 
-Prerequisites: `01-Hashing-Basics-Explained.md` (Hash Index section ke liye)
-Used in: All system designs that use databases (every design on this site)
+Prerequisites: `04-How-A-Query-Travels.md` (disk vs RAM, query planner samajh liya ho)
 
 ---
 
-## What is an Index?
+## 1. Index kya hai — aur kyu
 
-An index is a data structure that makes queries faster by avoiding full table scans. Instead of reading every row, the database uses the index to jump directly to matching rows.
+**Index** = ek extra data structure jo queries ko fast banata hai, **full table scan** avoid karke. Bina index, database har row check karta hai; index se seedha matching rows pe jump karta hai.
 
-**Real-world analogy:** A textbook index at the back of the book. Want to find "Binary Search"? Without an index, you'd flip through every page. With an index, you look up "Binary Search → page 142" and go directly there.
+**Analogy:** Ek textbook ka index (peeche wala). "Binary Search" dhundhna hai? Bina index → har page palto. Index se → "Binary Search → page 142" dekho, seedha wahan jao.
 
 ```
-Without index (full table scan):
+Bina index (full table scan):
   Table: 10 million rows
   Query: SELECT * FROM users WHERE email = 'bob@mail.com'
-  Operation: Scan all 10M rows, check each → O(N) → SLOW (seconds)
+  → saari 10M rows check karo → O(N) → SLOW (seconds)
 
-With index on email:
-  Index: sorted structure mapping email → row location
-  Query: SELECT * FROM users WHERE email = 'bob@mail.com'
-  Operation: Binary search in index → O(log N) → FAST (milliseconds)
+Index ke saath (email pe):
+  → index me binary-search jaisa lookup → O(log N) → FAST (milliseconds)
 ```
 
-> ### 🔍 Explained: "row" aur "disk read" ka matlab
-> **Row** = table ki ek single entry (jaise ek user): `{id: 1, name: "Bob", age: 25}`. Full table scan = database har aisi 10 million lines ko ek-ek karke check karta hai, chahe usse chahiye sirf 1 match.
->
-> **Disk read itni badi deal kyu hai:** Frontend me data mostly **RAM** me hota hai (JS objects, React state) — RAM access ~100 nanoseconds. Database apna data **disk** pe rakhta hai (persistence ke liye — crash ke baad bhi data bacha rahe, yehi "Durability" hai). Disk access RAM se **~1000x slower** hota hai (SSD ~100,000 ns). Isliye database design ka core goal hai: **jitna kam ho sake utne kam disk reads karo.**
->
-> Analogy: disk read for a database = network call for a frontend app — dono hi "expensive resources" hai jinhe minimize karna hai.
+> **"Row" aur "full scan" quick recap:** Row = ek record (`{id:1, name:"Bob", age:25}`). Full table scan = database har ek row ko ek-ek karke check karta hai. 10M rows = potentially 10M disk reads = seconds. Index isliye chahiye.
+
+> **Disk reads yaad hai? (lesson 04):** Disk RAM se ~1000x slow hai. Index ka poora point = **disk reads kam karna**. `O(N)` (slow) vs `O(log N)` (fast) directly disk-reads-count se correlate karta hai.
 
 ---
 
-## How B-Tree Index Works (Default in Postgres/MySQL)
+## 2. B-Tree Index — the default (Postgres/MySQL)
 
-The most common index type. A balanced tree structure where:
-- Each node holds multiple keys (sorted)
-- Leaf nodes point to actual table rows
-- Tree stays balanced (all leaves at same depth)
+Sabse common index type. Ek **balanced tree** structure:
+- Har node me multiple **sorted keys**
+- Leaf nodes actual table rows ko point karte hai
+- Tree balanced rehta hai (saare leaves same depth pe)
+
+### Node aur key kya hai (concrete example)
+
+Ek **node** = ek disk block/page (ek "box") jisme **100-500 sorted key entries** fit hote hai (na ki sirf 1 per node jaise normal binary tree). Isliye tree "wide" hota hai.
+
+Ek **key** = indexed column ki value (jaise `age=25`) + ek **pointer** jo batata hai row disk pe kaha hai. Key khud data nahi, ek signpost hai.
 
 ```
-Root: 30 - 60
-10 - 20 - 25          35 - 42 - 55          65 - 78 - 90
-Leaf: data pointers
+Table: users
+  {id:1, name:"Bob", age:25}, {id:2, name:"Alice", age:30}, {id:3, name:"Eve", age:25}
 
-Query: WHERE age = 42
-  Root: 42 > 30, 42 < 60 → go middle child
-  Internal: 42 > 35, 42 = 42 → found!
-  Leaf: points to row → fetch row data
+Index on age (tree form):
+                    [ age=27 ]                 ← root node
+                   /            \
+          [age=25]              [age=30]        ← leaf nodes (sorted keys)
+          pointers:              pointers:
+          → row 1 (Bob)          → row 2 (Alice)
+          → row 3 (Eve)
 
-Depth = ~3-4 for millions of rows
-Each lookup = 3-4 disk reads = milliseconds
+Query WHERE age=25:
+  root pe 25 < 27 → left child → key=25 mila → pointers se row 1, 3 fetch
+  → 2 hops (2 disk reads), Alice ka row touch hi nahi hua
 ```
 
-> ### 🔍 Explained: Node kya hai, key kya hai, aur ek concrete example
-> **Node** = B-Tree ka ek disk block/page (ek chhota "box") jisme **100-500 sorted key entries** fit ho jaate hai — na ki sirf 1 key per node (jaise normal binary tree). Isi wajah se tree "wide" hota hai, aur depth (levels) bahut kam lagte hai:
-> ```
-> 1 million rows  → depth ~3
-> 1 billion rows  → depth ~4-5 (barely increases!)
-> ```
-> Ye **logarithmic growth (O(log N))** hai — data 1000x badhe, depth sirf 1-2 level badhta hai.
->
-> **Key** ek indexed column ki value hai (jaise `age=25`), jiske saath ek **pointer** hota hai jo batata hai row disk pe kaha padi hai. Key khud data nahi hai, sirf ek signpost hai.
->
-> **Concrete example — `users` table:**
-> ```
-> Rows: {id:1, name:"Bob", age:25}, {id:2, name:"Alice", age:30}, {id:3, name:"Eve", age:25}
->
-> Index on age:
->   key=25 → pointers: [row_id 1, row_id 3]   (Bob aur Eve dono age=25)
->   key=30 → pointer:  [row_id 2]             (Alice)
-> ```
-> **Tree form me:**
-> ```
->                     [ age=27 ]                 ← root node
->                    /            \
->           [age=25]              [age=30]       ← leaf nodes (sorted keys)
->           pointers:              pointers:
->           → row_id 1 (Bob)       → row_id 2 (Alice)
->           → row_id 3 (Eve)
-> ```
-> Query `WHERE age=25`: root pe `25 < 27` → left child pe jao → `key=25` mila → seedha row_id 1, 3 fetch karo. **2 hops (2 disk reads)** lage, Alice ka row touch hua hi nahi.
->
-> **Without index comparison:**
-> ```
-> Without index: har row check karna padega → 10 million rows → potentially 10M disk reads
->   → seconds ya usse zyada
-> With index (B-Tree): sirf 3-4 disk reads → milliseconds
-> ```
-> Yehi `O(N)` (slow) vs `O(log N)` (fast) ka real meaning hai — Big-O directly disk-reads-count se correlate karta hai.
+### Depth aur "wide tree" ka magic
 
-B-Tree supports:
-- Equality: `WHERE age = 25`
-- Range: `WHERE age BETWEEN 20 AND 40`
-- Prefix: `WHERE name LIKE 'Bob%'`
-- Sorting: `ORDER BY age`
+Kyunki har node 100-500 keys rakhta hai, tree bahut wide + shallow hota hai:
+```
+1 million rows  → depth ~3
+1 billion rows  → depth ~4-5 (barely increases!)
+```
+Ye **logarithmic (O(log N))** growth hai — data 1000x badhe, depth sirf 1-2 level. **Har level = 1 disk read.** Isliye chahe billions rows ho, lookup sirf **3-5 disk reads = milliseconds**.
+
+**B-Tree supports:**
+```
+Equality:  WHERE age = 25
+Range:     WHERE age BETWEEN 20 AND 40
+Prefix:    WHERE name LIKE 'Bob%'
+Sorting:   ORDER BY age  (tree already sorted!)
+```
 
 ---
 
-## Hash Index
+## 3. Hash Index — O(1) but limited
 
-Maps key → exact row location using a hash function. O(1) lookups.
+Key ko hash function se seedha exact row location pe map karta hai. O(1) lookup.
 
 ```
-Hash Index on 'email' column:
+Hash Index on email:
+  hash('bob@mail.com')   → bucket 7 → row 42
+  hash('alice@mail.com') → bucket 3 → row 18
 
-hash('bob@mail.com')   → bucket 7  → row_id 42
-hash('alice@mail.com') → bucket 3  → row_id 18
-hash('eve@mail.com')   → bucket 7  → row_id 99 (collision, chaining)
-
-Query: WHERE email = 'bob@mail.com'
-  hash('bob@mail.com') = bucket 7 → check entries → found row 42
-  O(1) lookup!
+Query WHERE email = 'bob@mail.com':
+  hash('bob@mail.com') = bucket 7 → row 42 found → O(1)!
 ```
 
-Hash index supports: **Equality only** (`WHERE email = 'x'`)
-Hash index does NOT support: Range queries (`WHERE age > 25`), Sorting, Prefix matching
+> **Hash function recap (detail lesson 11 me):** hash = koi bhi input ko ek fixed-size number me convert karta hai, deterministically. Similar inputs → completely unrelated outputs.
 
-> ### 🔍 Explained: Hash index range queries kyu support nahi karta
-> Hash function ki property yahi hai ki **similar inputs → completely unrelated/random outputs** dete hai ("avalanche effect"):
-> ```
-> hash(24) = 9123847   hash(25) = 302981   hash(26) = 8123049   (sab random, unrelated)
-> ```
-> Isliye `age > 25` (26, 27, 28...) ke liye hash values me koi order/pattern nahi milta — data completely scattered hai buckets me.
->
-> **B-Tree range support karta hai kyunki wo data sorted order me rakhta hai** (hash nahi karta) — `25` dhundo, phir sequentially aage badho, sab contiguous milega:
-> ```
-> B-Tree (sorted):        [10, 15, 20, 25, 30, 35, 40]  → range easy, consecutive hai
-> Hash Index (scattered): bucket7, bucket2, bucket9, bucket1  → koi order nahi, range impossible
-> ```
+**Hash index supports:** sirf **Equality** (`WHERE email = 'x'`)
+**Does NOT support:** Range (`age > 25`), Sorting, Prefix
+
+**Kyu range nahi?** Hash "avalanche effect" — `hash(24), hash(25), hash(26)` bilkul unrelated random numbers. Koi order nahi bacha, isliye "range" nikalna impossible. B-Tree range support karta hai kyunki wo data **sorted** rakhta hai (hash nahi karta):
+```
+B-Tree (sorted):     [10,15,20,25,30,35,40]  → range easy, consecutive
+Hash (scattered):    bucket7, bucket2, bucket9  → koi order nahi, range impossible
+```
 
 ---
 
-## Composite Index (Multi-Column)
+## 4. Composite Index — multiple columns
 
-Index on multiple columns. Column order matters enormously.
+Ek index jo multiple columns pe ho. **Column order bahut matter karta hai.**
 
 ```sql
-CREATE INDEX idx_user_country_age ON users (country, age);
+CREATE INDEX idx_country_age ON users (country, age);
+```
+```
+Sorted by country FIRST, phir age within each country:
+  ('India', 20), ('India', 25), ('India', 30),
+  ('USA', 18), ('USA', 22), ('USA', 35)
 ```
 
-```
-Composite Index (country, age):
-  Sorted by country FIRST, then age within each country:
+### The Left-Prefix Rule (critical)
 
-  ('India', 20) → row 5
-  ('India', 25) → row 12
-  ('India', 30) → row 8
-  ('USA', 18)   → row 3
-  ('USA', 22)   → row 15
-  ('USA', 35)   → row 7
-```
+Index `(A, B, C)` in queries ke liye use hota hai:
 
-### The Left-Prefix Rule
-
-A composite index on `(A, B, C)` can be used for:
-
-| Query | Uses Index? | Why |
+| Query | Index use? | Why |
 |---|---|---|
-| `WHERE A = x` | Yes | Left-most column |
-| `WHERE A = x AND B = y` | Yes | Left prefix |
-| `WHERE A = x AND B = y AND C = z` | Yes | Full index |
-| `WHERE B = y` | No | Skipped A (left-most) |
-| `WHERE C = z` | No | Skipped A and B |
-| `WHERE A = x AND C = z` | Partial | Uses A only, scans for C |
-| `WHERE B = y AND C = z` | No | Left-most not included |
+| `WHERE A = x` | ✅ | Left-most |
+| `WHERE A = x AND B = y` | ✅ | Left prefix |
+| `WHERE A = x AND B = y AND C = z` | ✅ | Full |
+| `WHERE B = y` | ❌ | A skip kiya (left-most missing) |
+| `WHERE C = z` | ❌ | A, B skip kiye |
+| `WHERE A = x AND C = z` | ⚠️ Partial | Sirf A use, phir C ke liye scan |
 
-> ### 🔍 Explained: "Left-Prefix Rule" — ek analogy
-> Socho phone book alphabetically sorted hai **last-name, phir first-name** se (jaise composite index `(country, age)`). Agar tumhe sirf "first name = Bob" wale log dhundhne hai, phone book ka order tumhe koi help nahi karega — tumhe har last-name group ke andar scan karna padega (`WHERE B = y` case). Lekin agar tumhe "last name = Sharma" chahiye, seedha us section pe jump kar sakte ho (`WHERE A = x` case). Index sirf **left se right, in order** hi useful hota hai — beech se skip nahi kar sakte.
+**Analogy:** Phone book last-name phir first-name se sorted hai. "First name = Bob" dhundhna = koi help nahi (poora scan). "Last name = Sharma" = seedha jump. Index sirf **left-to-right, in order** useful hai.
 
-Rule of thumb: Put the most selective (most unique) column first, equality conditions before range conditions.
-
+**Rule of thumb:** most selective (unique) column pehle, **equality conditions pehle, range condition last:**
 ```sql
 -- GOOD: equality first, range last
 CREATE INDEX idx ON orders (user_id, status, created_at);
--- Supports: WHERE user_id = 123 AND status = 'active' AND created_at > '2024-01-01'
+-- WHERE user_id=123 AND status='active' AND created_at > '2024-01-01' ✅
 
--- BAD: range in the middle breaks subsequent columns
+-- BAD: range beech me → uske baad wale columns index use nahi kar paate
 CREATE INDEX idx ON orders (user_id, created_at, status);
--- WHERE user_id = 123 AND created_at > '2024-01-01' AND status = 'active'
--- Only uses (user_id, created_at), can't use status efficiently
+-- created_at range ke baad status index se filter nahi ho paata
 ```
 
 ---
 
-## Covering Index
+## 5. Covering Index — table touch hi mat karo
 
-An index that contains ALL columns needed by a query. The database can answer the query from the index alone without touching the table.
+Ek index jisme **query ke saare needed columns** ho. Database poora answer index se hi de deta hai, table tak jaaye bina.
 
 ```sql
--- Query:
 SELECT name, email FROM users WHERE age > 25;
 
--- Regular index on (age):
--- Step 1: Find matching rows in index → get row IDs
--- Step 2: Go to table, fetch 'name' and 'email' for each row (random I/O!)
+-- Regular index on (age): 2 hops
+--   Hop 1: index se age>25 wale row-IDs nikaalo
+--   Hop 2: har row-ID ke liye TABLE pe jao, name/email fetch karo
+--          (1000 rows match = 1000 EXTRA disk reads!)
 
--- Covering index on (age, name, email):
-CREATE INDEX idx_covering ON users (age, name, email);
--- Step 1: Find matching rows in index
--- Step 2: name and email are already IN the index → return directly!
--- No table access needed → much faster (index-only scan)
+-- Covering index on (age, name, email): 1 hop
+CREATE INDEX idx_cov ON users (age, name, email);
+--   name/email index me hi hai → table jaane ki zarurat nahi (index-only scan)
 ```
 
-Trade-off: Covering indexes are larger (store more data) and slower to update. Use for critical, frequently-run queries.
-
-> ### 🔍 Explained: Covering index actually kya bachaata hai
-> Normal index ke saath query 2 "hops" leti hai:
-> ```
-> Hop 1: Index pe jao → "age > 25" wale row-IDs nikaalo (index disk read)
-> Hop 2: Har row-ID ke liye ALAG table location pe jao, name/email fetch karo
->        (1000 matching rows = 1000 EXTRA disk reads!)
-> ```
-> Covering index me name/email **index ke andar hi** stored hai — Hop 2 ki zarurat hi nahi. Ek poora "extra hop to table" (jo random, expensive disk locations pe hota hai) completely skip ho jata hai.
+Ye "extra hop to table" (random disk locations, expensive) completely skip ho jaata hai.
+**Trade-off:** covering index bada hota hai (zyada data store) aur writes slow. Sirf critical, frequently-run queries ke liye.
 
 ---
 
-## Comparison Table
+## 6. Index types quick comparison
 
-| Index Type | Lookup | Range | Sorting | Size | Best For |
+| Type | Lookup | Range | Sort | Size | Best for |
 |---|---|---|---|---|---|
-| B-Tree | O(log N) | Yes | Yes | Medium | General purpose (default) |
-| Hash | O(1) | No | No | Small | Exact match lookups |
-| Composite | O(log N) | Yes (leftmost) | Yes | Larger | Multi-column queries |
-| Covering | O(log N) | Yes | Yes | Large | Avoiding table lookups |
-| GIN (inverted) | O(log N) | Depends | No | Large | Full-text search, arrays, JSON |
-| GiST | O(log N) | Yes | Depends | Medium | Geospatial, range types |
-| BRIN | O(1) | Yes | Yes | Tiny | Naturally ordered data (timestamps) |
+| B-Tree | O(log N) | ✅ | ✅ | Medium | General (default) |
+| Hash | O(1) | ❌ | ❌ | Small | Exact match |
+| Composite | O(log N) | ✅ (leftmost) | ✅ | Larger | Multi-column |
+| Covering | O(log N) | ✅ | ✅ | Large | Avoid table hops |
+| GIN | O(log N) | Depends | ❌ | Large | Full-text, arrays, JSON |
+| GiST | O(log N) | ✅ | Depends | Medium | Geospatial, ranges |
+| BRIN | O(1) | ✅ | ✅ | Tiny | Naturally-ordered data (timestamps) |
 
 ---
 
-## The Cost of Indexes (When NOT to Index)
+## 7. The Cost of Indexes — kab NAHI lagana
 
-Indexes are not free. Every index has costs:
-
+Indexes free nahi hai:
 ```
-1. WRITE OVERHEAD    — Every INSERT updates table + all indexes (5 indexes = 6 writes per INSERT)
-2. STORAGE            — Indexes consume disk space; many indexes can be larger than the table
-3. MEMORY              — Indexes should fit in RAM; more indexes = more RAM needed
-4. MAINTENANCE        — Indexes can fragment - need REINDEX; schema migrations take longer
+1. WRITE OVERHEAD — har INSERT table + saare indexes update karta hai
+                    (5 indexes = 6 writes per INSERT)
+2. STORAGE        — indexes disk space lete hai (kabhi table se bhi bade)
+3. MEMORY         — indexes RAM me fit hone chahiye (more indexes = more RAM)
+4. MAINTENANCE    — fragment ho sakte hai (REINDEX), migrations slow
 ```
 
-| Scenario | Why |
+**Kab index NAHI lagao:**
+| Scenario | Kyu |
 |---|---|
-| Small tables (< 1000 rows) | Full scan is fast enough, index overhead not worth it |
-| Write-heavy tables | Each write updates all indexes, slowing writes |
-| Low-cardinality columns | Boolean, status (3 values) — index doesn't help much |
-| Columns rarely queried | Index sits unused but costs storage/write perf |
-| Frequently updated columns | Every update = index modification |
-| Wide columns (TEXT, BLOB) | Index on large values is expensive |
+| Chhoti tables (< 1000 rows) | Full scan already fast, overhead worth nahi |
+| Write-heavy tables | Har write saare indexes update karta hai (slow writes) |
+| Low-cardinality columns | Boolean, status (3 values) — index zyada help nahi karta |
+| Rarely-queried columns | Index unused, but storage/write cost leta hai |
+| Frequently-updated columns | Har update = index modification |
+| Wide columns (TEXT/BLOB) | Bade values pe index expensive |
 
-> ### 🔍 Explained: "Low-cardinality" — ek chhota reminder
-> Cardinality = kitne unique values ek column me ho sakte hai. `status` column agar sirf `"active"/"inactive"/"banned"` (3 values) ho — index banao bhi toh database ko 3 hi "groups" milenge, jinme se har ek me lakhs rows honge. Ye scanning se zyada fast nahi hoga — bas extra storage + write overhead hi milega. **High cardinality columns (userId, email) index ke liye best hote hai.**
+> **Cardinality reminder:** kitne unique values. `status` (3 values) = low cardinality — index banao bhi toh 3 hi groups, har ek me lakhs rows, scan se zyada fast nahi. `userId`/`email` (millions unique) = high cardinality = index ke liye best.
 
 ---
 
-## Index Selection Strategy for Interviews
+## 8. Index selection strategy (interview-ready)
 
 ```
-Step 1: Identify hot queries (most frequent, slowest)
-Step 2: For each query, identify WHERE and ORDER BY columns
-Step 3: Create composite index following:
-        - Equality columns first (left to right)
-        - Range/sort column last
-Step 4: Check if covering index is worth it (critical queries)
-Step 5: Avoid over-indexing (max 5-7 indexes per table)
+Step 1: Hot queries identify karo (most frequent, slowest)
+Step 2: Har query ke WHERE aur ORDER BY columns dekho
+Step 3: Composite index banao:
+        - equality columns pehle (left to right)
+        - range/sort column last
+Step 4: Covering index worth hai? (critical queries ke liye)
+Step 5: Over-indexing avoid karo (max ~5-7 per table)
 ```
-
 ```sql
--- Example: E-commerce orders table
--- Hot query: "Get recent orders for a user filtered by status"
--- SELECT * FROM orders WHERE user_id = ? AND status = ? ORDER BY created_at DESC
-
--- Best index:
-CREATE INDEX idx_orders_user_status_created
-ON orders (user_id, status, created_at DESC);
-
--- user_id: equality (most selective)
--- status: equality
--- created_at: range/sort (last)
+-- Hot query: "user ke recent orders, status se filter"
+-- SELECT * FROM orders WHERE user_id=? AND status=? ORDER BY created_at DESC
+CREATE INDEX idx ON orders (user_id, status, created_at DESC);
+-- user_id: equality (selective), status: equality, created_at: range/sort last
 ```
 
----
-
-## Real-World Examples
-
-| Company | Indexing Strategy |
-|---|---|
-| Uber | Geospatial indexes (PostGIS/H3) for "drivers near me" queries |
-| Twitter | Composite indexes on (user_id, created_at) for timeline queries |
-| Shopify | Covering indexes on hot product catalog queries to avoid table lookups |
-| Stripe | B-tree indexes on payment_intent_id + idempotency_key for fast lookups |
-| Netflix | BRIN indexes on timestamp columns for time-range content queries |
+**Real companies:** Uber (geospatial indexes for "drivers near me"), Twitter (composite on `(user_id, created_at)` for timelines), Stripe (B-tree on `payment_intent_id` + idempotency key), Netflix (BRIN on timestamps for time-range).
 
 ---
 
-## Common Interview Questions
+## 9. Clustered vs Secondary index (interview favorite)
 
-**Q: "How would you optimize a slow query?"**
-A: First, run `EXPLAIN ANALYZE` to see if it's doing a full table scan. If yes, identify the WHERE/ORDER BY columns and create a composite index. Check if the query can use a covering index. Verify with `EXPLAIN` that the new index is actually being used.
+- **Clustered (primary key) index:** table ki rows **physically** primary-key order me stored hoti hai. Ek hi per table.
+- **Secondary index:** ek alag structure jo primary key ko point karta hai. Lookup me ek extra hop lagta hai (secondary → primary → full row).
 
-**Q: "Should you index every column?"**
-A: No. Indexes slow down writes and consume storage. Index only columns used in WHERE, JOIN, and ORDER BY clauses of frequent queries. Aim for 3-7 well-designed composite indexes per table.
+```
+Clustered (by id): rows themselves sorted by id on disk
+  [id:1 Bob] [id:2 Alice] [id:3 Eve]
 
-**Q: "What's the difference between a primary key index and a secondary index?"**
-A: Primary key index (clustered): the table data is physically stored in primary key order — only one per table. Secondary index: a separate structure pointing back to the primary key; lookups require an additional hop to fetch the full row.
-
-> ### 🔍 Explained: Clustered vs Secondary — quick visual
-> ```
-> Clustered (primary key) index: table rows THEMSELVES are stored sorted by id
->   [id:1, Bob] [id:2, Alice] [id:3, Eve]   ← physical disk order = id order
->
-> Secondary index (e.g., on email): a SEPARATE structure
->   email→id map:  "alice@..."→2, "bob@..."→1, "eve@..."→3
->   Query by email → find id in secondary index → THEN go to clustered index → get full row
->   (2 hops total — this is why secondary index lookups are slightly slower than primary key ones)
-> ```
-
-**Q: "How do indexes work with database sharding?"**
-A: Each shard has its own local indexes. A query on the shard key routes to one shard and uses local indexes efficiently. A query on a non-shard column might need to hit ALL shards (scatter-gather — see `03-Sharding-Terms-Explained.md`), which is slow. Consider a global secondary index (like DynamoDB GSI) for cross-shard queries.
+Secondary (on email): separate structure
+  "alice@"→id 2, "bob@"→id 1  → phir clustered se full row (2 hops)
+```
 
 ---
 
 ## Quick Self-Check
-1. Disk read RAM access se kitna slower hota hai, aur database design me ye kyu matter karta hai?
-2. B-Tree me ek "node" kya hai, aur "key" kya hai — apne words me example ke saath batao.
-3. Hash index range queries kyu support nahi kar sakta — root cause kya hai?
-4. Left-Prefix rule kya hai — composite index `(A,B,C)` par `WHERE B=y` kyu use nahi hota?
-5. Covering index kaunsa extra "hop" bachata hai?
-6. Clustered aur secondary index me difference kya hai?
+1. Index disk reads kaise kam karta hai — `O(N)` vs `O(log N)` ka disk-read se relation?
+2. B-Tree me "node" aur "key" kya hai — apne words me example ke saath.
+3. B-Tree depth billions rows pe bhi kam kyu rehti hai?
+4. Hash index range queries kyu nahi kar sakta (root cause)?
+5. Left-prefix rule kya hai — `(A,B,C)` pe `WHERE B=y` kyu use nahi hota?
+6. Covering index kaunsa "hop" bachata hai?
+7. Index kab NAHI lagana chahiye — 3 scenarios?
+8. Clustered aur secondary index me difference?
+
+---
+**Next:** `07-Query-Complexity-Big-O.md` — har operation ki exact cost, aur DB-by-DB comparison.
