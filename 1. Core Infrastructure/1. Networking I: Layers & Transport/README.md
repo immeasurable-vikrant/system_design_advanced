@@ -195,6 +195,15 @@ Ye connection reuse ka concept directly connection pooling (lesson 09) me expand
 
 ---
 
+## Flow — ek request end-to-end kaise chalti hai
+1. `fetch("https://api.example.com/users")` → browser DNS se `api.example.com` ka IP nikalta hai.
+2. OS ek **socket** kholta hai (client IP + random ephemeral port → server IP:443) aur **TCP 3-way handshake** karta hai (1 RTT), phir **TLS handshake** (1-2 RTT) se connection encrypt hota hai.
+3. HTTP request (L7) us socket me bytes ki tarah likhi jaati hai → TCP use segments me todta hai (L4), IP packets banata hai (L3), aur woh Wi-Fi/Ethernet frames → signals ban ke wire/hawa me jaate hai (L2/L1).
+4. Server pe ulta hota hai: L1 → L7 tak data jud ke HTTP request banti hai. App response likhta hai, jo wahi raasta pakad ke wapas aata hai. Lost segment TCP retransmit karta hai, order bhi wahi sambhalta hai.
+5. Response ke baad socket **keep-alive** se khula rehta hai, taaki agli request bina naye handshake ke chale.
+
+---
+
 ## Quick Self-Check
 1. IP, port, socket — teeno ka difference, ek analogy se? IPv4 vs IPv6?
 2. Network tab me socket kyu nahi dikhta, aur WebSocket "socket" se kaise alag hai?
